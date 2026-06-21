@@ -1,3 +1,8 @@
+# וודא שהספריות הנדרשות מותקנות אצלך:
+# BiocManager::install("curatedMetagenomicData")
+library(curatedMetagenomicData)
+library(SummarizedExperiment)
+
 download_study_by_name <- function(study_name, feature_type = "pathway_abundance") {
   
   # 1. חיפוש אוטומטי של המשאבים
@@ -12,9 +17,13 @@ download_study_by_name <- function(study_name, feature_type = "pathway_abundance
   
   selected_id <- target_id[1]
   
-  # 3. הכנת תיקיית פלט
-  output_dir <- "data_output"
-  if (!dir.exists(output_dir)) { dir.create(output_dir) }
+  # 3. הכנת תיקיית פלט (הפניה לתיקיית data שנמצאת ב-Root)
+  # ה-.. אומר ל-R לעלות מתיקיית ה-r_script לתיקיית האב של הפרויקט
+  output_dir <- file.path("..", "data")
+  
+  if (!dir.exists(output_dir)) { 
+    dir.create(output_dir) 
+  }
   
   print(paste("Downloading:", selected_id))
   
@@ -26,7 +35,6 @@ download_study_by_name <- function(study_name, feature_type = "pathway_abundance
   features <- as.data.frame(assay(tse))
   
   # 5. שמירה
-  # טיפ: אנחנו מוסיפים את סוג הפיצ'ר לשם הקובץ כדי שלא ידרס את הקודמים
   metadata_path <- file.path(output_dir, paste0(study_name, "_metadata.csv"))
   features_path <- file.path(output_dir, paste0(study_name, "_", feature_type, "_features.csv"))
   
@@ -36,9 +44,7 @@ download_study_by_name <- function(study_name, feature_type = "pathway_abundance
   print(paste("Success! Files saved in", output_dir))
 }
 
-# דוגמאות להרצה:
-# ברירת המחדל (חיידקים):
-download_study_by_name("FengQ_2015") 
-
-# עכשיו אפשר גם להוריד מסלולים מטבוליים:
-download_study_by_name("FengQ_2015", feature_type = "pathway_abundance")
+# --- דוגמאות להרצה ---
+# זכור: כל מה שתוריד כאן יגיע ישירות לתיקיית ה-data שבשורש הפרויקט
+ download_study_by_name("FengQ_2015") 
+# download_study_by_name("FengQ_2015", feature_type = "pathway_abundance")

@@ -220,3 +220,8 @@ __marimo__/
 client_secrets.json
 credentials.json
 mycreds.txt
+data_output
+/data_output
+/data
+data
+.Rproj.user

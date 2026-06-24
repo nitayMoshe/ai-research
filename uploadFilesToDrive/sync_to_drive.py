@@ -18,8 +18,11 @@ def sync_to_drive():
         print(f"שגיאה: לא נמצאה תיקייה בנתיב: {LOCAL_FOLDER}")
         return
 
-    # אתחול האוטנטיקציה
+   # אתחול האוטנטיקציה
     gauth = GoogleAuth()
+    
+    # בקשת Refresh Token (הכרחי לחידוש אוטומטי / גישת אופליין)
+    gauth.settings['get_refresh_token'] = True 
     
     # טעינת אישורים קיימים
     gauth.LoadCredentialsFile("mycreds.txt")

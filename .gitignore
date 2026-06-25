@@ -225,3 +225,5 @@ data_output
 /data
 data
 .Rproj.user
+results
+data_test

@@ -31,7 +31,7 @@ all_studies <- c("AsnicarF_2017", "AsnicarF_2021", "BackhedF_2015", "BedarfJR_20
 target_feature_type <- "pathway_abundance"
 
 # התיקייה שבה יישמרו כל קבצי ה-CSV
-output_dir <- file.path("..", "data")
+output_dir <- file.path("..", '..', "data")
 
 # קובץ הלוגים שיגיד לנו מי הצליח ומי נכשל (נשמר בתיקיית העבודה הנוכחית)
 log_file <- "download_log.txt"

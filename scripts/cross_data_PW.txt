@@ -5,7 +5,7 @@ import seaborn as sns
 import os
 import glob
 import random
-from collections import Counter
+import itertools
 from math import comb
 
 def load_all_study_pathways(data_folder):
@@ -39,70 +39,89 @@ def load_all_study_pathways(data_folder):
     print(f"✅ נטענו בהצלחה {len(study_pathways)} מחקרים.")
     return study_pathways
 
-def filter_low_prevalence_pathways(study_pathways, min_prevalence_pct=0.20):
+def find_lowest_overlap_pairs(study_pathways, num_pairs_to_remove=1):
     """
-    מוצאת תהליכים (PWs) שמופיעים במעט מדי מחקרים (מתחת לאחוז החסימה)
-    ומסירה אותם לחלוטין מהניסוי כדי לראות אם קו הבסיס עולה.
+    מחשב את החפיפה בין כל זוגות המחקרים האפשריים ומחזיר את הזוגות 
+    בעלי החפיפה האחוזית הנמוכה ביותר (ה-Outliers של אושרית).
     """
-    total_studies = len(study_pathways)
+    studies = list(study_pathways.keys())
+    pair_results = []
     
-    # ספירה בכמה מחקרים מופיע כל תהליך בנפרד
-    pw_counter = Counter()
-    for pathways in study_pathways.values():
-        pw_counter.update(pathways)
+    for study_a, study_b in itertools.combinations(studies, 2):
+        intersection = study_pathways[study_a].intersection(study_pathways[study_b])
+        union_set = study_pathways[study_a].union(study_pathways[study_b])
+        overlap_pct = (len(intersection) / len(union_set)) * 100 if len(union_set) > 0 else 0
+        pair_results.append(((study_a, study_b), overlap_pct))
+    
+    # מיון לפי אחוז החפיפה מהנמוך לגבוה
+    pair_results.sort(key=lambda x: x[1])
+    
+    # שליפת הזוגות הנמוכים ביותר
+    lowest_pairs = [pair[0] for pair in pair_results[:num_pairs_to_remove]]
+    
+    print(f"🚨 זוגות המחקרים עם החפיפה הנמוכה ביותר שנמצאו:")
+    for i, (pair, pct) in enumerate(pair_results[:num_pairs_to_remove]):
+        print(f"   {i+1}. {pair[0]} ↔️ {pair[1]} ({pct:.2f}% חפיפה)")
         
-    total_unique_pws_before = len(pw_counter)
-    
-    # זיהוי תהליכים שלא עומדים ברף הנוכחות המינימלי
-    kept_pws = set()
-    removed_count = 0
-    
-    for pw, count in pw_counter.items():
-        prevalence = count / total_studies
-        if prevalence >= min_prevalence_pct:
-            kept_pws.add(pw)
-        else:
-            removed_count += 1
-            
-    print(f"🚨 ניתוח תהליכים (PWs):")
-    print(f"   - סך הכל תהליכים ייחודיים בדאטה: {total_unique_pws_before}")
-    print(f"   - הוסרו {removed_count} תהליכים שמופיעים בפחות מ-{min_prevalence_pct*100}% מהמחקרים.")
-    print(f"   - נשארו {len(kept_pws)} תהליכים יציבים להמשך החישוב.")
-    
-    # בניית המילון מחדש רק עם התהליכים שעברו את הסינון
-    filtered_study_pathways = {}
-    for study_name, pathways in study_pathways.items():
-        filtered_set = pathways.intersection(kept_pws)
-        if filtered_set: # שומרים את המחקר רק אם נשארו לו תהליכים
-            filtered_study_pathways[study_name] = filtered_set
-            
-    return filtered_study_pathways
+    return lowest_pairs
 
-def calculate_overlap_data(study_pathways, max_samples_per_k=50):
+def calculate_overlap_data(study_pathways, max_samples_per_k=50, remove_lowest_pairs=False):
     """
-    מחזיר את פונקציית החישוב המקורית והיעילה שלך.
     מחשב את חיתוך התהליכים עבור קומבינציות שונות של מחקרים (מ-1 עד N).
+    משתמש בדגימה והסרה דינמית מבלי להעמיס על זיכרון ה-RAM.
     """
     studies = list(study_pathways.keys())
     N = len(studies)
     results = []
     
+    # איתור הזוגות החלשים במידה והדגל מופעל
+    excluded_pairs = []
+    if remove_lowest_pairs:
+        excluded_pairs = find_lowest_overlap_pairs(study_pathways, num_pairs_to_remove=1) 
+    
     for k in range(1, N + 1):
         print(f"⚙️ מחשב חפיפות עבור {k} מחקרים משולבים...")
         
         total_possible_combos = comb(N, k)
+        combos_to_process = []
         
+        # תרחיש א': מספר הקומבינציות הכולל קטן מסך הדגימות המבוקש (קורה ב-K נמוך או גבוה מאוד)
         if total_possible_combos <= max_samples_per_k:
-            import itertools
-            combos = list(itertools.combinations(studies, k))
+            all_combos = itertools.combinations(studies, k)
+            for combo in all_combos:
+                contains_bad_pair = False
+                if remove_lowest_pairs:
+                    for pair in excluded_pairs:
+                        if pair[0] in combo and pair[1] in combo:
+                            contains_bad_pair = True
+                            break
+                if not contains_bad_pair:
+                    combos_to_process.append(combo)
+                    
+        # תרחיש ב': מניעת פיצוץ זיכרון - דגימה אקראית וסינון תוך כדי תנועה (On-the-fly)
         else:
             combos_set = set()
-            while len(combos_set) < max_samples_per_k:
-                sampled = tuple(sorted(random.sample(studies, k)))
-                combos_set.add(sampled)
-            combos = list(combos_set)
+            attempts = 0
+            max_attempts = max_samples_per_k * 100 # שומר על הסקריפט מלהיתקע בלולאה אינסופית בערכי K קיצוניים
             
-        for combo in combos:
+            while len(combos_set) < max_samples_per_k and attempts < max_attempts:
+                attempts += 1
+                sampled = tuple(sorted(random.sample(studies, k)))
+                
+                contains_bad_pair = False
+                if remove_lowest_pairs:
+                    for pair in excluded_pairs:
+                        if pair[0] in sampled and pair[1] in sampled:
+                            contains_bad_pair = True
+                            break
+                
+                if not contains_bad_pair:
+                    combos_set.add(sampled)
+            
+            combos_to_process = list(combos_set)
+            
+        # חישוב המדדים לקומבינציות שנבחרו/נדגמו
+        for combo in combos_to_process:
             intersection = study_pathways[combo[0]]
             union_set = study_pathways[combo[0]]
             
@@ -124,7 +143,7 @@ def calculate_overlap_data(study_pathways, max_samples_per_k=50):
 
 def plot_swarm_and_save(df_results, output_dir, file_suffix=""):
     """
-    מייצר ושומר שני גרפי Swarm Plot נפרדים בתוך תיקיית הפלט הייעודית.
+    מייצר ושומר שני גרפי Swarm Plot נפרדים בתוך תיקיית הפלט שנבחרה.
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -178,38 +197,28 @@ def plot_swarm_and_save(df_results, output_dir, file_suffix=""):
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     INPUT_DATA_DIR = os.path.normpath(os.path.join(script_dir, '..', 'data')) 
+    
+    # שמירה בתיקייה הייעודית שביקשת
     OUTPUT_RESULTS_DIR = os.path.normpath(os.path.join(script_dir, '..', 'cross_data_PW_RESULTS'))
     
     # ----------------------------------------------------
-    # הגדרות הניסוי של אושרית על התהליכים (PWs):
-    # FILTER_PROBLEMATIC_PWS: 
-    #   True  = הפעלת הסינון על התהליך (יסנן תהליכים נדירים)
-    #   False = ריצה מקורית ומלאה ללא סינון תהליכים
-    FILTER_PROBLEMATIC_PWS = True 
-    
-    # MIN_STUDY_PREVALENCE:
-    #   רף הנוכחות המינימלי של תהליך. למשל: 0.20 אומר ש-PW שלא מופיע 
-    #   בלפחות 20% מהמחקרים (כלומר לפחות ב-18 מחקרים מתוך 93) ייזרק החוצה.
-    #   אם תרצו להחמיר ולדרוש נוכחות של 66% מהמחקרים, שנו ל-0.66.
-    MIN_STUDY_PREVALENCE = 0.20 
+    # דגל הניסוי של אושרית:
+    # False = הרצה רגילה ומלאה (תאימות מלאה לאחור)
+    # True = הרצה מסוננת ללא אאוטליירים נמוכים
+    RUN_OSH_EXPERIMENT = True 
     # ----------------------------------------------------
     
-    suffix = f"_filtered_pws_above_{int(MIN_STUDY_PREVALENCE*100)}pct" if FILTER_PROBLEMATIC_PWS else ""
+    suffix = "_filtered_outliers" if RUN_OSH_EXPERIMENT else ""
     
     if not os.path.exists(OUTPUT_RESULTS_DIR):
         os.makedirs(OUTPUT_RESULTS_DIR)
         print(f"📁 נוצרה תיקיית פלט חדשה: {OUTPUT_RESULTS_DIR}")
 
-    # 1. טעינת הנתונים המלאה
     study_pathways = load_all_study_pathways(INPUT_DATA_DIR)
     
     if study_pathways:
-        # 2. סינון ה-PWs הבעייתיים במידה והדגל מופעל
-        if FILTER_PROBLEMATIC_PWS:
-            study_pathways = filter_low_prevalence_pathways(study_pathways, min_prevalence_pct=MIN_STUDY_PREVALENCE)
-            
-        # 3. חישוב נתוני החפיפה (רץ מהר ובטוח)
-        df_results = calculate_overlap_data(study_pathways, max_samples_per_k=50)
+        # חישוב הנתונים ללא סכנת קריסת זיכרון
+        df_results = calculate_overlap_data(study_pathways, max_samples_per_k=50, remove_lowest_pairs=RUN_OSH_EXPERIMENT)
         
         # שמירת ה-CSV
         csv_filename = f"pathway_overlap_data{suffix}.csv"
@@ -217,7 +226,7 @@ if __name__ == "__main__":
         df_results.to_csv(csv_full_path, index=False)
         print(f"📊 הנתונים הגולמיים נשמרו ב-{csv_full_path}")
         
-        # 4. יצירת הציורים
+        # יצירת הציורים
         plot_swarm_and_save(df_results, OUTPUT_RESULTS_DIR, file_suffix=suffix)
     else:
         print("❌ לא נמצאו קבצי features מתאימים בתיקיית הנתונים.")

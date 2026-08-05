@@ -1,0 +1,408 @@
+# סקריפט גרסה 8 (המהדורה הסופית והחסינה) - כולל הגנות ל-NaN ב-Optuna, 
+# יצירת תיקיית preProcessingResults נפרדת, Test חיצוני, ו-Disease Agnostic V3.
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import roc_auc_score
+import optuna
+import os
+import glob
+import json
+import warnings
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# התעלמות מאזהרות מיותרות של ספריות והשתקת לוגים פנימיים של Optuna
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.ERROR)
+
+# ==============================================================================
+# 0. BLACKLIST - 16 מחקרים בעייתיים מרובי-מחלות להסרה מוחלטת
+# ==============================================================================
+BLACKLIST_STUDIES = [
+    'FengQ_2015', 'GhensiP_2019', 'HanniganGD_2017', 'HMP_2019_t2d', 
+    'IaniroG_2022', 'KarlssonFH_2013', 'LiJ_2014', 'LiJ_2017', 
+    'LiSS_2016', 'LoombaR_2017', 'MetaCardis_2020_a', 'ThomasAM_2018a', 
+    'VatanenT_2016', 'XieH_2016', 'YachidaS_2019', 'ZellerG_2014'
+]
+
+# ==============================================================================
+# 1. REAL DATA LOADER (V3 CACHE - DISEASE AGNOSTIC)
+# ==============================================================================
+def load_real_microbiome_data(data_folder):
+    print("\n📂 [Data Loader] Initiating real data loading from:", data_folder)
+    
+    cache_dir = os.path.join(data_folder, ".cache")
+    cache_x_path = os.path.join(cache_dir, "X_global_v3.pkl")
+    cache_y_path = os.path.join(cache_dir, "y_global_v3.pkl")
+    cache_meta_path = os.path.join(cache_dir, "cache_metadata_v3.json")
+    
+    feature_files = glob.glob(os.path.join(data_folder, "*_features.csv"))
+    metadata_files = glob.glob(os.path.join(data_folder, "*_metadata.csv"))
+    
+    if not feature_files:
+        raise FileNotFoundError(f"No feature files found in {data_folder}!")
+        
+    current_state = {"cache_version": 3} # V3: Disease Agnostic (0 for control, 1 for anything else)
+    for f in feature_files + metadata_files:
+        stat = os.stat(f)
+        current_state[os.path.basename(f)] = {"mtime": stat.st_mtime, "size": stat.st_size}
+        
+    if os.path.exists(cache_x_path) and os.path.exists(cache_y_path) and os.path.exists(cache_meta_path):
+        try:
+            with open(cache_meta_path, "r") as f:
+                cached_state = json.load(f)
+            if cached_state == current_state:
+                print("⚡ [Cache Hit V3] Loading processed disease-agnostic data...")
+                return pd.read_pickle(cache_x_path), pd.read_pickle(cache_y_path)
+        except Exception:
+            pass
+            
+    print("🔄 [Cache Miss V3] Rebuilding disease-agnostic dataset...")
+    
+    all_features_dfs = []
+    all_labels = []
+    
+    for file_path in feature_files:
+        study_name = os.path.basename(file_path).replace("_pathway_abundance_features.csv", "").replace("_features.csv", "")
+        
+        # דילוג על הרשימה השחורה שאושרית הגדירה
+        if study_name in BLACKLIST_STUDIES:
+            print(f"🚫 [Blacklist] Skipping study: {study_name}")
+            continue
+            
+        try:
+            df_feat = pd.read_csv(file_path, index_col=0)
+            df_meta = pd.read_csv(os.path.join(data_folder, f"{study_name}_metadata.csv"), index_col=0)
+            
+            # חיפוש דינמי של עמודת תווית המחלה
+            label_col = next((col for col in ["study_condition", "disease", "status", "disease_state", "Group", "group"] if col in df_meta.columns), None)
+            if not label_col:
+                label_col = next((col for col in df_meta.columns if any(k in col.lower() for k in ["condition", "disease", "status", "class", "group"])), None)
+            
+            if not label_col:
+                continue
+                
+            df_meta[label_col] = df_meta[label_col].astype(str).str.lower().str.strip()
+            
+            # הגדרה אוניברסלית: כל מי שמוגדר כ-Control, Healthy או Normal יהיה קבוצת הביקורת (0)
+            control_kws = ["control", "healthy", "healthy_control", "con", "normal", "donor"]
+            
+            common_samples = df_feat.index.intersection(df_meta.index)
+            if len(common_samples) == 0:
+                continue
+                
+            df_feat_filtered = df_feat.loc[common_samples].copy()
+            df_meta_filtered = df_meta.loc[common_samples]
+            
+            # לוגיקת החיתוך החדשה (Disease Agnostic):
+            # 0 = Control
+            # 1 = Anything else (Disease)
+            y_study = df_meta_filtered[label_col].apply(lambda val: 0 if any(k in val for k in control_kws) else 1)
+            
+            # וידוא שיש לנו גם חולים (1) וגם בריאים (0) במחקר
+            if len(y_study.unique()) < 2:
+                print(f"⚠️  [Skip] {study_name} lacks multiple classes.")
+                continue
+                
+            df_feat_filtered["Study"] = study_name
+            all_features_dfs.append(df_feat_filtered)
+            all_labels.append(y_study)
+            print(f"✅ [Loaded] {study_name}: {len(common_samples)} samples synced.")
+            
+        except Exception as e:
+            print(f"❌ [Error] {study_name}: {str(e)}")
+            
+    print("🔄 [Merging] Concatenating and cleaning data...")
+    X_global = pd.concat(all_features_dfs, axis=0, sort=False).fillna(0.0)
+    study_series = X_global["Study"]
+    X_global = X_global.drop(columns=["Study"]).astype(np.float32)
+    
+    # הסרת עמודות מזהמות כמו תהליכים לא ממופים
+    valid_mask = ~X_global.columns.str.lower().str.contains('|'.join(["unmapped", "unintegrated"]))
+    X_global = X_global.loc[:, valid_mask]
+    
+    # סינון גלובלי (שומר רק פיצ'רים שקיימים לפחות אצל 5 אנשים)
+    non_zero_counts = np.count_nonzero(X_global.values, axis=0)
+    X_global = X_global[X_global.columns[non_zero_counts >= 5]]
+    
+    X_global["Study"] = study_series
+    y_global = pd.concat(all_labels, axis=0)
+    
+    os.makedirs(cache_dir, exist_ok=True)
+    X_global.to_pickle(cache_x_path)
+    y_global.to_pickle(cache_y_path)
+    with open(cache_meta_path, "w") as f:
+        json.dump(current_state, f)
+        
+    print(f"🏆 [Success] Global V3 Dataset Built: {X_global.shape[0]} samples, {X_global.shape[1]-1} features.")
+    return X_global, y_global
+
+# ==============================================================================
+# 2. PREPROCESSING PIPELINE FUNCTIONS
+# ==============================================================================
+def apply_preprocessing(X_train, X_test, config, feature_cols):
+    """
+    מבצעת את סדר הפעולות המתמטיות באופן וקטורי מבוסס על הגדרות ה-config
+    """
+    X_tr, X_te = X_train.copy(), X_test.copy()
+    current_features = feature_cols.copy()
+    
+    # 1. Ranking (Must happen first if requested)
+    if config.get("rank", False):
+        X_tr = pd.DataFrame(X_tr).rank(axis=1, method='min').values.astype(np.float32)
+        X_te = pd.DataFrame(X_te).rank(axis=1, method='min').values.astype(np.float32)
+    
+    # 2. Sparsity Filtering
+    if config.get("sparsity", 0) > 0:
+        non_zero = np.count_nonzero(X_tr > 0, axis=0)
+        valid_idx = np.where(non_zero >= config["sparsity"])[0]
+        X_tr, X_te = X_tr[:, valid_idx], X_te[:, valid_idx]
+        current_features = [current_features[i] for i in valid_idx]
+        
+    # 3. Pathway Collapse (Sum / PCA)
+    if config.get("collapse", None):
+        method = config["collapse"]
+        pwy_groups = {}
+        for idx, col in enumerate(current_features):
+            pwy_groups.setdefault(col.split('|', 1)[0], []).append(idx)
+        
+        unique_pwys = list(pwy_groups.keys())
+        
+        if method in ["sum", "mean"]:
+            proj = np.zeros((len(current_features), len(unique_pwys)), dtype=np.float32)
+            for pwy_idx, pwy in enumerate(unique_pwys):
+                indices = pwy_groups[pwy]
+                proj[indices, pwy_idx] = 1.0 if method == "sum" else 1.0/len(indices)
+            X_tr, X_te = X_tr @ proj, X_te @ proj
+        elif method == "pca":
+            X_tr_col = np.zeros((X_tr.shape[0], len(unique_pwys)), dtype=np.float32)
+            X_te_col = np.zeros((X_te.shape[0], len(unique_pwys)), dtype=np.float32)
+            pca = PCA(n_components=1, random_state=42)
+            for pwy_idx, pwy in enumerate(unique_pwys):
+                indices = pwy_groups[pwy]
+                if len(indices) == 1:
+                    X_tr_col[:, pwy_idx] = X_tr[:, indices[0]]
+                    X_te_col[:, pwy_idx] = X_te[:, indices[0]]
+                else:
+                    X_tr_col[:, pwy_idx] = pca.fit_transform(X_tr[:, indices]).ravel()
+                    X_te_col[:, pwy_idx] = pca.transform(X_te[:, indices]).ravel()
+            X_tr, X_te = X_tr_col, X_te_col
+        current_features = unique_pwys
+
+    # 4. Oshrit Log & Z-Score Normalization
+    if config.get("oshrit_log", False):
+        np.multiply(X_tr, 1e7, out=X_tr)
+        np.add(X_tr, 0.1, out=X_tr)
+        np.log10(X_tr, out=X_tr)
+        
+        np.multiply(X_te, 1e7, out=X_te)
+        np.add(X_te, 0.1, out=X_te)
+        np.log10(X_te, out=X_te)
+        
+        scaler = StandardScaler(copy=False)
+        X_tr = scaler.fit_transform(X_tr)
+        X_te = scaler.transform(X_te)
+
+    return X_tr, X_te
+
+# ==============================================================================
+# 3. EVALUATION & OPTUNA (With NaN and Fold Protection)
+# ==============================================================================
+def evaluate_method(X_train_full, y_train_full, X_test_final, y_test_final, feature_cols, config, lgb_params):
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    train_aucs, val_aucs = [], []
+    
+    # א. Cross-Validation פנימי להערכת ביצועי Train/Val ולמניעת Overfitting
+    for train_idx, val_idx in skf.split(X_train_full, y_train_full):
+        X_tr, X_val = X_train_full[train_idx], X_train_full[val_idx]
+        y_tr, y_val = y_train_full.iloc[train_idx], y_train_full.iloc[val_idx]
+        
+        # 🛡️ הגנה מפני קריסת NaN: מוודא שגם בקבוצת האימון וגם בביקורת יש חולים ובריאים
+        if len(np.unique(y_tr)) < 2 or len(np.unique(y_val)) < 2:
+            continue
+            
+        X_tr_proc, X_val_proc = apply_preprocessing(X_tr, X_val, config, feature_cols)
+        
+        clf = lgb.LGBMClassifier(**lgb_params)
+        clf.fit(X_tr_proc, y_tr)
+        
+        train_aucs.append(roc_auc_score(y_tr, clf.predict_proba(X_tr_proc)[:, 1]))
+        val_aucs.append(roc_auc_score(y_val, clf.predict_proba(X_val_proc)[:, 1]))
+        
+    # במידה וכל ה-Folds נפלו בגלל דלילות קיצונית, נחזיר ניחוש אקראי (0.5) כדי לא לקרוס
+    mean_train_auc = np.mean(train_aucs) if train_aucs else 0.5
+    mean_val_auc = np.mean(val_aucs) if val_aucs else 0.5
+        
+    # ב. מבחן חיצוני אמיתי - אימון על כלל נתוני ה-Train ובחינה על ה-20% שבכספת (Test)
+    X_train_proc, X_test_proc = apply_preprocessing(X_train_full, X_test_final, config, feature_cols)
+    clf = lgb.LGBMClassifier(**lgb_params)
+    clf.fit(X_train_proc, y_train_full)
+    
+    # גם כאן הגנה מפני קבוצת מבחן ריקה מאחד הקלאסים
+    if len(np.unique(y_test_final)) > 1:
+        test_auc = roc_auc_score(y_test_final, clf.predict_proba(X_test_proc)[:, 1])
+    else:
+        test_auc = 0.5
+    
+    return mean_train_auc, mean_val_auc, test_auc
+
+def run_optuna_tuning(X_train_full, y_train_full, feature_cols, config):
+    def objective(trial):
+        # הגבלות כדי להאיץ את LightGBM בסביבת Intra-Study על נתונים קטנים
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 20, 60),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+            'max_depth': trial.suggest_int('max_depth', 2, 5),
+            'num_leaves': trial.suggest_int('num_leaves', 7, 20),
+            'verbosity': -1,
+            'n_jobs': 1 # Single core לחסכון בזמן תקשורת על נתונים קטנים
+        }
+        _, val_auc, _ = evaluate_method(X_train_full, y_train_full, X_train_full[:2], y_train_full[:2], feature_cols, config, params)
+        return val_auc
+
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=15)
+    
+    # 🛡️ הגנה למקרה שאופטונה נכשלה בכל הניסיונות שלה (למשל במחקרים פצפונים ובעייתיים)
+    try:
+        return study.best_params
+    except ValueError:
+        return {'n_estimators': 30, 'learning_rate': 0.05, 'max_depth': 3, 'num_leaves': 10, 'verbosity': -1, 'n_jobs': 1}
+
+# ==============================================================================
+# 4. MAIN EXECUTOR & REPORT GENERATOR
+# ==============================================================================
+if __name__ == "__main__":
+    print("\n" + "="*80)
+    print("🔬 MICROBIOME INTRA-STUDY EVALUATOR (TRAIN/VAL/TEST + PLOTS + LEADERBOARD)")
+    print("="*80)
+    
+    # הגדרות נתיבים נכונות (תוצאות מופרדות מנתוני הגלם)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_path = os.path.normpath(os.path.join(script_dir, '..', 'data'))
+    output_dir = os.path.normpath(os.path.join(script_dir, '..', 'preProcessingResults'))
+    os.makedirs(output_dir, exist_ok=True)
+    
+    X, y = load_real_microbiome_data(data_path)
+    studies = X["Study"].unique()
+    
+    base_lgb_params = {'n_estimators': 50, 'learning_rate': 0.05, 'max_depth': 3, 'num_leaves': 7, 'verbosity': -1, 'n_jobs': 1}
+    all_results = []
+    
+    # מילון הקונפיגורציות המדויק מתמטית שהסכמנו עליו
+    configs = {
+        "Raw": {},
+        "Sparsity_10%": {'sparsity': 0.1},
+        "Ranked": {'rank': True},
+        "Collapse_Sum": {'collapse': 'sum'},
+        "Collapse_PCA": {'collapse': 'pca'},
+        "Oshrit_Log_Z": {'oshrit_log': True},
+        "Rank_then_Collapse_Sum": {'rank': True, 'collapse': 'sum'},
+        "Collapse_Sum_then_Log_Z": {'collapse': 'sum', 'oshrit_log': True},
+        "All_Combined": {'sparsity': 0.1, 'collapse': 'sum', 'oshrit_log': True}
+    }
+    
+    for idx, study in enumerate(studies, 1):
+        print(f"\n[{idx}/{len(studies)}] Analyzing Study: {study}...")
+        
+        study_mask = X["Study"] == study
+        X_study = X[study_mask].drop(columns=["Study"])
+        y_study = y[study_mask]
+        
+        if len(y_study.unique()) < 2 or len(y_study) < 30:
+            print(f"  ↳ Skipped (Insufficient cases/controls or too small: N={len(y_study)})")
+            continue
+            
+        # ⚡ MAGIC SPEEDUP: הסרת עמודות שהן אפס מוחלט עבור המחקר הספציפי הזה
+        non_zero_mask = np.any(X_study.values > 0, axis=0)
+        X_study = X_study.iloc[:, non_zero_mask]
+        feature_cols = list(X_study.columns)
+        
+        # 80/20 Train-Test Split חיצוני עם סטרטיפיקציה
+        X_train, X_test, y_train, y_test = train_test_split(X_study.values, y_study, test_size=0.2, stratify=y_study, random_state=42)
+        
+        # עדכון אחוזי ה-Sparsity לפי גודל המחקר הנוכחי (10% מקבוצת האימון)
+        sparsity_th = max(1, int(0.1 * X_train.shape[0]))
+        for conf_name in configs:
+            if 'sparsity' in configs[conf_name]:
+                configs[conf_name]['sparsity'] = sparsity_th
+        
+        study_res = {
+            "Study_ID": study,
+            "N_Samples": len(y_study),
+            "N_Healthy": sum(y_study == 0),
+            "N_Disease": sum(y_study == 1)
+        }
+        
+        # הרצת כל הקונפיגורציות
+        for method_name, conf in configs.items():
+            tr_auc, v_auc, te_auc = evaluate_method(X_train, y_train, X_test, y_test, feature_cols, conf, base_lgb_params)
+            study_res[f"{method_name}_Train"] = round(tr_auc, 4)
+            study_res[f"{method_name}_Val"] = round(v_auc, 4)
+            study_res[f"{method_name}_Test"] = round(te_auc, 4)
+            
+        # אופטונה על מודל הבסיס ועל המודל המשולב שלכם
+        print("  ↳ Running Optuna on Raw Data...")
+        best_raw_params = run_optuna_tuning(X_train, y_train, feature_cols, {})
+        tr_auc, v_auc, te_auc = evaluate_method(X_train, y_train, X_test, y_test, feature_cols, {}, best_raw_params)
+        study_res["Raw_Optuna_Train"], study_res["Raw_Optuna_Val"], study_res["Raw_Optuna_Test"] = round(tr_auc, 4), round(v_auc, 4), round(te_auc, 4)
+        
+        print("  ↳ Running Optuna on All_Combined Data...")
+        best_comb_params = run_optuna_tuning(X_train, y_train, feature_cols, configs["All_Combined"])
+        tr_auc, v_auc, te_auc = evaluate_method(X_train, y_train, X_test, y_test, feature_cols, configs["All_Combined"], best_comb_params)
+        study_res["Combined_Optuna_Train"], study_res["Combined_Optuna_Val"], study_res["Combined_Optuna_Test"] = round(tr_auc, 4), round(v_auc, 4), round(te_auc, 4)
+        
+        all_results.append(study_res)
+        print("  ↳ Done! ✅")
+
+    # ==============================================================================
+    # 5. יצירת תוצרים (CSV, גרפים, ו-Leaderboard) בתיקיית preProcessingResults
+    # ==============================================================================
+    if all_results:
+        df_results = pd.DataFrame(all_results)
+        csv_path = os.path.join(output_dir, "Intra_Study_Results.csv")
+        df_results.to_csv(csv_path, index=False)
+        print(f"\n💾 Full detailed table exported to: {csv_path}")
+        
+        # --- יצירת גרף Swarmplot + Boxplot ---
+        test_cols = [c for c in df_results.columns if c.endswith("_Test")]
+        df_melt = df_results.melt(id_vars=["Study_ID"], value_vars=test_cols, var_name="Method", value_name="Test_AUC")
+        df_melt["Method"] = df_melt["Method"].str.replace("_Test", "")
+        
+        plt.figure(figsize=(16, 9))
+        sns.boxplot(data=df_melt, x="Method", y="Test_AUC", color="white", fliersize=0)
+        sns.swarmplot(data=df_melt, x="Method", y="Test_AUC", palette="Set1", size=6, alpha=0.8)
+        
+        plt.title("Intra-Study Test AUC Across Preprocessing Methods (Disease Agnostic)", fontsize=16, fontweight='bold')
+        plt.xticks(rotation=45, ha='right', fontsize=10)
+        plt.ylabel("Hold-out Test AUC", fontsize=12)
+        plt.axhline(0.5, color='red', linestyle='--', linewidth=1.5, label='Random Guess (0.5)')
+        plt.legend(loc="lower right")
+        plt.ylim(0.3, 1.05)
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        plot_path = os.path.join(output_dir, "Intra_Study_AUC_Comparison.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✅ Visualization saved to: {plot_path}")
+
+        # --- יצירת ה-Leaderboard ---
+        df_test_only = df_results[test_cols]
+        winners = df_test_only.idxmax(axis=1).value_counts().reset_index()
+        winners.columns = ["Winning_Method", "Num_Wins"]
+        winners["Winning_Method"] = winners["Winning_Method"].str.replace("_Test", "")
+        winners["Win_Percentage"] = (winners["Num_Wins"] / len(df_results) * 100).round(1).astype(str) + "%"
+        
+        print("\n" + "="*60)
+        print("🏆 LEADERBOARD: Which method achieved the highest Test AUC?")
+        print("="*60)
+        print(winners.to_string(index=False))
+        print("="*60 + "\n")
+        
+        leaderboard_path = os.path.join(output_dir, "Intra_Study_Leaderboard.csv")
+        winners.to_csv(leaderboard_path, index=False)
+        print(f"💾 Leaderboard saved to: {leaderboard_path}")
